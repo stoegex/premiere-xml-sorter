@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-FCP XML Sorter v3.1 – Sortiert Premiere/FCP XML Timelines nach Erstellungsdatum.
+FCP XML Sorter v3.2 – Sortiert Premiere/FCP XML Timelines nach Erstellungsdatum.
 """
 import xml.etree.ElementTree as ET
 import customtkinter as ctk
 from tkinter import filedialog
 import os
-import platform
-import urllib.parse
 from datetime import datetime
+from xml_sorter_core import analyze_xml, find_child, indent, sort_sequences
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -32,112 +31,6 @@ C_WARN     = "#F59E0B"
 C_ERROR    = "#EF4444"
 C_LOG_BG   = "#0B0B0E"
 C_LOG_TEXT = "#4B5563"
-
-# ----------------------------------------------------------------------
-# Hilfsfunktionen
-# ----------------------------------------------------------------------
-def get_file_creation_date(filepath):
-    """Aufnahmedatum einer Datei.
-    Verwendet st_mtime (Kamera-Aufnahmedatum wird als modification time gespeichert).
-    st_ctime ist auf Windows das Kopier-Datum, NICHT das Aufnahmedatum!
-    Fallback: st_birthtime (macOS), dann st_ctime.
-    """
-    if not filepath or not os.path.exists(filepath):
-        return None
-    try:
-        stat = os.stat(filepath)
-        # st_mtime = Aufnahmedatum der Kamera (bleibt beim Kopieren erhalten)
-        # st_ctime = auf Windows: Datum des Kopierens (FALSCH fuer Sortierung)
-        # st_birthtime = macOS: echtes Erstellungsdatum
-        if hasattr(stat, 'st_birthtime'):
-            # macOS: nimm das frueheste von birthtime und mtime
-            birth = datetime.fromtimestamp(stat.st_birthtime)
-            mtime = datetime.fromtimestamp(stat.st_mtime)
-            return min(birth, mtime)
-        else:
-            # Windows: st_mtime ist das echte Kamera-Aufnahmedatum
-            return datetime.fromtimestamp(stat.st_mtime)
-    except Exception as e:
-        print(f"  [Warnung] Fehler beim Lesen von {filepath}: {e}")
-        return None
-
-def resolve_path(url_str, base_dir, mapping=None):
-    """Wandelt file://URL oder relativen Pfad in absoluten Pfad um.
-       mapping: dict { '/Volumes/LUMIX': 'H:\\LUMIX' } zum Ersetzen von Pfadanfängen.
-    """
-    if not url_str:
-        return None
-    url_str = urllib.parse.unquote(url_str.strip())
-    if url_str.startswith('file://'):
-        parsed = urllib.parse.urlparse(url_str)
-        path = parsed.path
-        if platform.system() == 'Windows' and path.startswith('/'):
-            path = path[1:]
-        if not path and parsed.netloc:
-            path = parsed.netloc
-    else:
-        path = url_str
-
-    # Pfad-Mapping anwenden (vor Normalisierung)
-    if mapping:
-        for old, new in mapping.items():
-            if path.startswith(old):
-                path = new + path[len(old):]
-                break
-
-    if os.path.isabs(path):
-        return os.path.normpath(path)
-    return os.path.normpath(os.path.join(base_dir, path))
-
-def find_all_file_paths(clipitem, base_dir, mapping=None):
-    """Findet alle Pfade in einem Clipitem (Namespace-unabhängig)."""
-    found = []
-    added = set()
-    def add(resolved, source):
-        if resolved and resolved not in added:
-            added.add(resolved)
-            found.append((resolved, source))
-
-    # Alle <file> Elemente (Namespace-Wildcard)
-    for file_elem in clipitem.findall('.//{*}file'):
-        # pathurl
-        for pathurl in file_elem.findall('{*}pathurl'):
-            if pathurl.text:
-                add(resolve_path(pathurl.text.strip(), base_dir, mapping), 'file/pathurl')
-        # name
-        for name in file_elem.findall('{*}name'):
-            if name.text:
-                add(resolve_path(name.text.strip(), base_dir, mapping), 'file/name')
-        # url
-        for url in file_elem.findall('{*}url'):
-            if url.text:
-                add(resolve_path(url.text.strip(), base_dir, mapping), 'file/url')
-
-    # <link> -> <media> -> <file>
-    for link in clipitem.findall('{*}link'):
-        for file_elem in link.findall('.//{*}file'):
-            for pathurl in file_elem.findall('{*}pathurl'):
-                if pathurl.text:
-                    add(resolve_path(pathurl.text.strip(), base_dir, mapping), 'link/…')
-
-    return found
-
-def indent(elem, level=0):
-    """Pretty-Print für XML."""
-    indent_str = "  "
-    i = "\n" + level * indent_str
-    if len(elem):
-        if not elem.text or not elem.text.strip():
-            elem.text = i + indent_str
-        for child in elem:
-            indent(child, level + 1)
-            if not child.tail or not child.tail.strip():
-                child.tail = i + indent_str
-        if not elem.tail or not elem.tail.strip():
-            elem.tail = i
-    else:
-        if level and (not elem.tail or not elem.tail.strip()):
-            elem.tail = i
 
 # ----------------------------------------------------------------------
 # GUI-Klasse
@@ -169,12 +62,11 @@ class FCPXMLSorter:
 
         self.filepath = None
         self.tree = None
-        self.clips_data = {}
+        self.sequence_contexts = []
         self.total_clips = 0
         self.files_found = 0
         self.files_missing = 0
         self.mapping = {}
-        self.audio_clips_data = {}
 
         self._build_ui()
 
@@ -394,6 +286,7 @@ class FCPXMLSorter:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
+        self.sequence_contexts = []
         self.status_label.configure(text="Lade ...", text_color=C_MUTED)
         self.st_dot.configure(text="○ ", text_color=C_MUTED)
         self.info_label.configure(text="")
@@ -417,116 +310,30 @@ class FCPXMLSorter:
             return
 
         base_dir = os.path.dirname(os.path.abspath(self.filepath))
+        analysis = analyze_xml(root, base_dir, self.mapping)
+        self.sequence_contexts = analysis["sequences"]
+        self.total_clips = analysis["video_clip_count"]
+        self.files_found = analysis["total_found"]
+        self.files_missing = analysis["total_missing"]
 
-        sequences = root.findall('.//sequence')
-        video_tracks = []
-        audio_tracks = []
-        for seq in sequences:
-            media = seq.find('media')
-            if media is None:
-                continue
-            video = media.find('video')
-            if video is not None:
-                video_tracks.extend(video.findall('track'))
-            audio = media.find('audio')
-            if audio is not None:
-                audio_tracks.extend(audio.findall('track'))
+        self.log(f"File-Registry: {analysis['file_registry_count']} eindeutige Quelldateien gefunden")
+        self.log(f"Sequenzen: {len(self.sequence_contexts)}")
+        self.log(
+            f"Video-Clips: {self.total_clips} ({self.files_found} mit Datum, {self.files_missing} ohne)"
+        )
+        self.log(
+            f"Audio-Clips: {analysis['audio_clip_count']} (werden link-basiert synchron verschoben)"
+        )
 
-        total_found = 0
-        total_missing = 0
-        all_dates = []
-        macos_paths = set()
-
-        # Premiere dedupliziert <file>-Elemente: die erste Erwaehnung enthaelt
-        # die volle <pathurl>, alle weiteren nur noch <file id="file-XYZ"/>.
-        # Wir bauen daher zuerst ein Register: file-id -> resolved path
-        file_id_to_path = {}
-        for file_elem in root.findall('.//file'):
-            fid = file_elem.get('id')
-            if not fid:
-                continue
-            for pathurl in file_elem.findall('pathurl'):
-                if pathurl.text:
-                    p = resolve_path(pathurl.text.strip(), base_dir, self.mapping)
-                    if p:
-                        file_id_to_path[fid] = p
-                        break
-            if fid not in file_id_to_path:
-                # Versuche auch ohne Namespace-Wildcard
-                for pathurl in file_elem.findall('{*}pathurl'):
-                    if pathurl.text:
-                        p = resolve_path(pathurl.text.strip(), base_dir, self.mapping)
-                        if p:
-                            file_id_to_path[fid] = p
-                            break
-
-        self.log(f"File-Registry: {len(file_id_to_path)} eindeutige Quelldateien gefunden")
-
-        # Nur Video-Clips laden und Datum auslesen
-        video_clips_data = {}
-        for track in video_tracks:
-            clipitems = track.findall('clipitem')
-            if not clipitems:
-                continue
-            track_clips = []
-            for clip in clipitems:
-                # Pfad suchen: zuerst direkt im <file> Element, dann ueber File-Registry
-                paths = find_all_file_paths(clip, base_dir, self.mapping)
-                existing = next((p for p, s in paths if os.path.exists(p)), None)
-
-                # Fallback: via file id in der Registry
-                if not existing:
-                    for file_elem in clip.findall('.//file'):
-                        fid = file_elem.get('id')
-                        if fid and fid in file_id_to_path:
-                            p = file_id_to_path[fid]
-                            if os.path.exists(p):
-                                existing = p
-                                break
-
-                for p, src in paths:
-                    if p and (p.startswith('/Volumes/') or p.startswith('/Users/')):
-                        macos_paths.add(p)
-
-                date = get_file_creation_date(existing) if existing else None
-                if date:
-                    all_dates.append(date)
-                    total_found += 1
-                else:
-                    total_missing += 1
-                track_clips.append({
-                    'element': clip,
-                    'date': date,
-                    'path': existing,
-                    'id': clip.get('id', '?'),
-                })
-            video_clips_data[track] = track_clips
-
-        # Audio-Tracks separat speichern (kein Datum noetig)
-        audio_clips_data = {}
-        for track in audio_tracks:
-            clipitems = track.findall('clipitem')
-            if not clipitems:
-                continue
-            track_clips = []
-            for clip in clipitems:
-                track_clips.append({
-                    'element': clip,
-                    'id': clip.get('id', '?'),
-                })
-            audio_clips_data[track] = track_clips
-
-        self.clips_data = video_clips_data
-        self.audio_clips_data = audio_clips_data
-        self.total_clips = sum(len(v) for v in video_clips_data.values())
-        self.files_found = total_found
-        self.files_missing = total_missing
-
-        self.log(f"Video-Clips: {self.total_clips} ({total_found} mit Datum, {total_missing} ohne)")
-        self.log(f"Audio-Clips: {sum(len(v) for v in audio_clips_data.values())} (werden automatisch synchron verschoben)")
+        if analysis["warnings"]:
+            shown = analysis["warnings"][:5]
+            for warning in shown:
+                self.log(f"[Warnung] {warning}")
+            if len(analysis["warnings"]) > len(shown):
+                self.log(f"[Warnung] {len(analysis['warnings']) - len(shown)} weitere Link-Warnungen")
 
         fname = os.path.basename(self.filepath)
-        n_audio = sum(len(v) for v in audio_clips_data.values())
+        n_audio = analysis["audio_clip_count"]
 
         # Drop-Zone aktualisieren
         self.dz_icon.configure(text="\u2705")
@@ -537,29 +344,35 @@ class FCPXMLSorter:
         # Status-Dot
         self.st_dot.configure(text="\u25cf ", text_color=C_ACCENT)
         self.status_label.configure(
-            text=f"{self.total_clips} Video-Clips geladen, {total_found} mit Datum",
+            text=f"{self.total_clips} Video-Clips in {len(self.sequence_contexts)} Sequenzen geladen",
             text_color=C_ACCENT_L
         )
 
-        if total_found > 0:
-            if all_dates:
+        if self.files_found > 0:
+            if analysis["all_dates"]:
                 self.info_label.configure(
-                    text=f"Fr\u00fchestes: {min(all_dates):%Y-%m-%d %H:%M}   Sp\u00e4testes: {max(all_dates):%Y-%m-%d %H:%M}",
+                    text=(
+                        f"Fr\u00fchestes: {min(analysis['all_dates']):%Y-%m-%d %H:%M}   "
+                        f"Sp\u00e4testes: {max(analysis['all_dates']):%Y-%m-%d %H:%M}"
+                    ),
                     text_color=C_MUTED
                 )
         else:
-            self.log(f"Keine Datei gefunden ({total_missing} Pfade fehlen)")
-            if macos_paths:
+            self.log(f"Keine Datei gefunden ({self.files_missing} Pfade fehlen)")
+            if analysis["macos_paths"]:
                 self.log("macOS-Pfade erkannt! (Die Dateien m\u00fcssen auf diesem PC auffindbar sein)")
             else:
                 self.log("Keine Dateien gefunden. \u00dcberpr\u00fcfe die Pfade in der XML.")
 
         if self.mapping:
             self.mapping_label.configure(text=f"Mapping aktiv: {self.mapping}")
-        self.sort_btn.configure(state="normal")
+        if self.total_clips > 0:
+            self.sort_btn.configure(state="normal")
+        else:
+            self._show_error("Keine Video-Clips gefunden.")
 
     def _sort_and_save(self):
-        if not self.filepath or not self.clips_data:
+        if not self.filepath or not self.sequence_contexts:
             return
 
         self.progress.start()
@@ -568,93 +381,23 @@ class FCPXMLSorter:
 
         self.log("\nSortiere Clips ...")
 
-        def get_frame(element, tag):
-            el = element.find(f'.//{{{"*"}}}{tag}')
-            if el is None:
-                el = element.find(tag)
-            if el is not None and el.text:
-                try: return int(el.text)
-                except ValueError: return 0
-            return 0
-
-        def set_frame(element, tag, value):
-            el = element.find(f'.//{{{"*"}}}{tag}')
-            if el is None:
-                el = element.find(tag)
-            if el is not None:
-                el.text = str(value)
-
-        # 1. Alle Video-Clips flach sammeln (bereits in self.clips_data)
-        all_video_clips = []
-        for track, clips in self.clips_data.items():
-            for c in clips:
-                c['track'] = track
-                c['orig_start'] = get_frame(c['element'], 'start')
-                c['orig_end']   = get_frame(c['element'], 'end')
-                all_video_clips.append(c)
-
-        # 2. Video-Clips chronologisch sortieren (ohne Datum -> ans Ende)
-        sorted_video = sorted(
-            all_video_clips,
-            key=lambda c: (c['date'] is None, c['date'] if c['date'] else datetime.max)
+        sort_stats = sort_sequences(self.sequence_contexts)
+        self.log(
+            f"Sequenzen sortiert: {sort_stats['sequence_count']}  ·  Gruppen: {sort_stats['group_count']}  ·  verschoben: {sort_stats['moved_groups']}"
         )
-
-        # 3. Neue Timeline-Positionen fuer Video-Clips berechnen
-        #    und den Versatz (offset) pro Clip merken
-        current_pos = 0
-        for c in sorted_video:
-            duration = c['orig_end'] - c['orig_start']
-            c['new_start'] = current_pos
-            c['new_end']   = current_pos + duration
-            c['offset']    = c['new_start'] - c['orig_start']
-            set_frame(c['element'], 'start', c['new_start'])
-            set_frame(c['element'], 'end',   c['new_end'])
-            current_pos += duration
-
-        # 4. Audio-Clips verschieben: jeder Audio-Clip bekommt den Offset
-        #    des Video-Clips, mit dem er sich am meisten ueberlappt
-        all_audio_clips = []
-        for track, clips in self.audio_clips_data.items():
-            for c in clips:
-                c['track'] = track
-                c['orig_start'] = get_frame(c['element'], 'start')
-                c['orig_end']   = get_frame(c['element'], 'end')
-                all_audio_clips.append(c)
-
-        for ac in all_audio_clips:
-            best_offset = 0
-            max_overlap = -1
-            for vc in sorted_video:
-                overlap = min(ac['orig_end'], vc['orig_end']) - max(ac['orig_start'], vc['orig_start'])
-                if overlap > max_overlap:
-                    max_overlap = overlap
-                    best_offset = vc['offset']
-            set_frame(ac['element'], 'start', ac['orig_start'] + best_offset)
-            set_frame(ac['element'], 'end',   ac['orig_end']   + best_offset)
-
-        # 5. XML-Reihenfolge der Clipitems innerhalb jedes Tracks anpassen
-        for track, clips in self.clips_data.items():
-            sorted_clips = sorted(clips, key=lambda c: get_frame(c['element'], 'start'))
-            children = list(track)
-            clip_indices = [i for i, child in enumerate(children)
-                            if child.tag == 'clipitem' or child.tag.endswith('}clipitem')]
-            for idx, c in zip(clip_indices, sorted_clips):
-                children[idx] = c['element']
-            track[:] = children
-
-        for track, clips in self.audio_clips_data.items():
-            sorted_clips = sorted(clips, key=lambda c: get_frame(c['element'], 'start'))
-            children = list(track)
-            clip_indices = [i for i, child in enumerate(children)
-                            if child.tag == 'clipitem' or child.tag.endswith('}clipitem')]
-            for idx, c in zip(clip_indices, sorted_clips):
-                children[idx] = c['element']
-            track[:] = children
+        if sort_stats["inferred_audio_clips"]:
+            self.log(
+                f"[Hinweis] {sort_stats['inferred_audio_clips']} unverknoepfte Audio-Clips wurden ueber Timeline-Logik einem Video zugeordnet und mitverschoben"
+            )
+        if sort_stats["unlinked_audio_clips"]:
+            self.log(
+                f"[Hinweis] {sort_stats['unlinked_audio_clips']} unverknoepfte Audio-Clips blieben an ihrer Originalposition"
+            )
 
         # 6. Bin-Struktur fuer Premiere Pro anlegen
         root = self.tree.getroot()
-        if not root.find('project'):
-            sequences = root.findall('sequence')
+        if find_child(root, 'project') is None:
+            sequences = [elem for elem in list(root) if elem.tag == 'sequence' or elem.tag.endswith('}sequence')]
             if sequences:
                 for seq in sequences:
                     root.remove(seq)

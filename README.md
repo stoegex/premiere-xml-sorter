@@ -1,10 +1,12 @@
-# XML Sorter v3.2
+# XML Sorter v3.3
 
-Eine Python-Anwendung mit grafischer Oberfläche, die Premiere-Pro-/XMEML-Timelines nach dem Dateidatum der Videoquellen sortiert.
+Eine Python-Anwendung mit grafischer Oberfläche, die Premiere-Pro-/XMEML-Timelines nach der Aufnahmezeit der Videoquellen sortiert.
 
 ## Funktionen
 
-- Sortiert Video-Clips chronologisch nach dem Datum ihrer Quelldatei
+- Sortiert Video-Clips chronologisch nach eingebetteter Aufnahmezeit (MOV/MP4)
+- Erkennt QuickTime-/MP4-Metadaten ohne zusätzliche Installation; nutzt Dateizeitstempel nur als Fallback
+- Ermöglicht Zeitkorrekturen für einzelne Kameras oder Medienordner
 - Verschiebt verknüpfte Video- und Audio-Clips als gemeinsame Gruppe
 - Erkennt eindeutig zuordenbares, nicht verknüpftes Mikrofon-Audio anhand seiner Timeline-Position und verschiebt es mit dem Video
 - Lässt mehrdeutiges, nicht verknüpftes Audio unverändert, damit keine falsche Zuordnung entsteht
@@ -64,6 +66,7 @@ python3 xml-sorter.py
 1. XML-Datei auswählen oder in das Fenster ziehen.
 2. Das Tool liest Sequenzen, Tracks, Clip-Links und vorhandene Quelldateien.
 3. Das Sortierdatum wird ausschließlich von der Videoquelle bestimmt.
+   Eingebettete MOV-/MP4-Aufnahmezeiten haben Vorrang vor Datei-Zeitstempeln.
 4. Explizit verknüpftes Audio wird als Teil derselben Gruppe verschoben.
 5. Nicht verknüpftes Audio wird nur dann mitverschoben, wenn die Timeline-Zuordnung zu einem Video eindeutig ist.
 6. Mehrdeutiges Audio bleibt an seiner ursprünglichen Position und wird im Log gemeldet.
@@ -71,14 +74,31 @@ python3 xml-sorter.py
 
 Die Originaldatei wird nicht überschrieben.
 
-## Datumsbestimmung
+## Datumsbestimmung und Kameras
 
-Das Tool verwendet den Dateisystem-Zeitstempel der gefundenen Videoquelldatei:
+Für `.mov`, `.mp4` und `.m4v` liest das Tool zuerst den eingebetteten QuickTime-/MP4-Movie-Header (`mvhd`). Das funktioniert beispielsweise mit Material von Panasonic, iPhone und GoPro, sofern die Kamera eine gültige Aufnahmezeit gespeichert hat.
+
+Falls keine verwertbare eingebettete Zeit vorhanden ist, verwendet es den Dateisystem-Zeitstempel der gefundenen **genau dieser** Videoquelldatei:
 
 - Windows und Linux: `st_mtime`
 - macOS: der frühere Wert aus `st_birthtime` und `st_mtime`
 
-Audio-Dateien werden nicht für die chronologische Sortierung ausgewertet. Kopieren, Transkodieren oder Bearbeiten einer Videodatei kann deren Zeitstempel verändern und damit die Sortierreihenfolge beeinflussen.
+Audio-Dateien werden nicht für die chronologische Sortierung ausgewertet. Kopieren, Transkodieren oder Bearbeiten einer Videodatei beeinflusst die Sortierung nur dann, wenn keine gültige eingebettete Aufnahmezeit mehr vorhanden ist.
+
+### Gerenderte GoPro-360-Videos
+
+Referenziert die XML eine GoPro-Renderdatei nach dem Schema `GS010592_<suffix>.mp4`, sucht das Tool im gleichen Ordner gezielt nach `GS010592.360`. Wenn die Originaldatei vorhanden ist und eine gültige eingebettete Zeit enthält, hat diese Zeit Vorrang vor den Metadaten der Renderdatei. Das verhindert, dass ein Exportzeitpunkt statt der Aufnahmezeit die Sortierung bestimmt. Ohne eindeutig passende Original-`.360` greift die normale MP4-/Fallback-Logik.
+
+### Unterschiedliche Kamera-Uhren
+
+Über **„Kamera-Uhr korrigieren“** können Korrekturregeln nach einem beliebigen Teil des Medienpfads hinterlegt werden. Jede Zeile hat dieses Format:
+
+```text
+00_S1II = +01:00
+01_IPHONE = -00:30
+```
+
+Die längste passende Regel wird angewendet. Die Regeln verändern keine Mediendateien und keine eingebetteten Metadaten; sie gelten nur für die Sortierung, solange die Anwendung geöffnet ist. So lässt sich eine falsch eingestellte Kamera-Uhr ausgleichen.
 
 ## Verhalten bei Audio
 
@@ -95,6 +115,7 @@ Die automatische zeitliche Zuordnung erzeugt keine neue permanente XML-Verknüpf
 - Komplexe Timelines mit parallelen Video-Layern, Overlays oder Multicam-Strukturen können durch die chronologische Linearisierung ihre ursprüngliche Anordnung verlieren.
 - Nicht eindeutig zuordenbares Audio wird aus Sicherheitsgründen nicht verschoben.
 - Fehlende oder nicht erreichbare Medienpfade verhindern eine zuverlässige Datumsbestimmung.
+- Ungültige oder fehlende eingebettete Aufnahmezeiten fallen auf den Dateizeitstempel zurück; das wird im Log ausgewiesen.
 - Moderne FCPXML-Strukturen werden nicht vollständig unterstützt.
 
 Vor dem produktiven Einsatz sollte die erzeugte XML in einem neuen Premiere-Pro-Projekt importiert und kontrolliert werden.
@@ -105,7 +126,7 @@ Vor dem produktiven Einsatz sollte die erzeugte XML in einem neuen Premiere-Pro-
 python3 -m unittest discover -s tests -v
 ```
 
-Die Tests decken verknüpftes Audio, eindeutig zuordenbares externes Audio, mehrdeutiges Audio und mehrere Sequenzen ab.
+Die Tests decken MOV/MP4-Metadaten, Kamera-Zeitkorrekturen, den Dateisystem-Fallback, verknüpftes Audio, eindeutig zuordenbares externes Audio, mehrdeutiges Audio und mehrere Sequenzen ab.
 
 ## Lizenz
 

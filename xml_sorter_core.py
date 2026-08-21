@@ -2,7 +2,52 @@ import os
 import platform
 import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import re
+from io import StringIO
+import struct
+
+
+QUICKTIME_EPOCH = datetime(1904, 1, 1, tzinfo=timezone.utc)
+MEDIA_EXTENSIONS = {".mov", ".mp4", ".m4v", ".360"}
+GOPRO_RENDER_PATTERN = re.compile(r"^(GS\d{6})_.+\.mp4$", re.IGNORECASE)
+
+def parse_with_repair(filepath, logger=None):
+    try:
+        return ET.parse(filepath), False
+    except ET.ParseError as e:
+        if logger:
+            logger(f"[Warnung] XML ParseError: {e}. Versuche automatische Reparatur...")
+
+        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+
+        if content.rfind('<') > content.rfind('>'):
+            content += '>'
+
+        stack = []
+        tag_pattern = re.compile(r'<(/?)(\w+)([^>]*)>')
+        for match in tag_pattern.finditer(content):
+            is_closing = match.group(1) == '/'
+            tag_name = match.group(2)
+            attrs = match.group(3)
+            is_self_closing = attrs.strip().endswith('/')
+            if is_self_closing or tag_name.lower() == 'xml' or tag_name.lower().startswith('?'):
+                continue
+            if not is_closing:
+                stack.append(tag_name)
+            else:
+                if stack and stack[-1] == tag_name:
+                    stack.pop()
+                elif tag_name in stack:
+                    while stack and stack.pop() != tag_name:
+                        pass
+        for tag in reversed(stack):
+            content += f'</{tag}>'
+        try:
+            return ET.parse(StringIO(content)), True
+        except Exception as e2:
+            raise Exception(f"XML konnte auch nach Reparaturversuch nicht gelesen werden: {e2}")
 
 
 def local_name(tag):
@@ -49,6 +94,194 @@ def append_text_child(parent, name, text):
     child.text = str(text)
     parent.append(child)
     return child
+
+
+
+def _iter_iso_boxes(handle, end_position):
+    """Yield ISO-BMFF boxes without loading potentially large media files."""
+    while handle.tell() + 8 <= end_position:
+        start = handle.tell()
+        header = handle.read(8)
+        size, box_type = struct.unpack(">I4s", header)
+        header_size = 8
+
+        if size == 1:
+            extended_size = handle.read(8)
+            if len(extended_size) != 8:
+                return
+            size = struct.unpack(">Q", extended_size)[0]
+            header_size = 16
+        elif size == 0:
+            size = end_position - start
+
+        if size < header_size or start + size > end_position:
+            return
+
+        yield box_type, start, size, header_size
+        handle.seek(start + size)
+
+
+def get_embedded_creation_date(filepath):
+    """Read the QuickTime/MP4 movie-header creation time, if available.
+
+    MOV and MP4 from common cameras store an ISO-BMFF ``mvhd`` atom.  Reading
+    that atom is deliberately dependency-free and does not require decoding the
+    file.  Its timestamp is UTC, so it is converted to the local wall-clock
+    time used for filesystem timestamps before sorting.
+    """
+    if not filepath or not os.path.exists(filepath):
+        return None
+    if os.path.splitext(filepath)[1].lower() not in MEDIA_EXTENSIONS:
+        return None
+
+    try:
+        file_size = os.path.getsize(filepath)
+        with open(filepath, "rb") as handle:
+            for box_type, start, size, header_size in _iter_iso_boxes(handle, file_size):
+                if box_type != b"moov":
+                    continue
+
+                moov_end = start + size
+                handle.seek(start + header_size)
+                for child_type, child_start, child_size, child_header_size in _iter_iso_boxes(handle, moov_end):
+                    if child_type != b"mvhd":
+                        continue
+
+                    handle.seek(child_start + child_header_size)
+                    version_data = handle.read(4)
+                    if len(version_data) != 4:
+                        return None
+                    version = version_data[0]
+                    timestamp_size = 8 if version == 1 else 4
+                    raw_timestamp = handle.read(timestamp_size)
+                    if len(raw_timestamp) != timestamp_size:
+                        return None
+                    seconds = struct.unpack(">Q" if version == 1 else ">I", raw_timestamp)[0]
+                    if seconds == 0:
+                        return None
+
+                    value = QUICKTIME_EPOCH + timedelta(seconds=seconds)
+                    # Zero or wildly future values are common placeholders in
+                    # transcodes and should not outrank a usable file timestamp.
+                    if value.year < 1970 or value > datetime.now(timezone.utc) + timedelta(days=366):
+                        return None
+                    return value.astimezone().replace(tzinfo=None)
+    except (OSError, OverflowError, struct.error, ValueError):
+        return None
+
+    return None
+
+
+def find_gopro_original_360(rendered_path):
+    """Return the original GoPro 360 file for a rendered MP4, when unambiguous.
+
+    GoPro Player exports use names such as ``GS010592_2026-08-16_19-51-36.mp4``
+    while the camera original is ``GS010592.360`` in the same directory.
+    Restricting the match to this exact prefix avoids accidentally pairing an
+    arbitrary MP4 with a neighbouring 360 file.
+    """
+    if not rendered_path or os.path.splitext(rendered_path)[1].lower() != ".mp4":
+        return None
+
+    match = GOPRO_RENDER_PATTERN.match(os.path.basename(rendered_path))
+    if not match:
+        return None
+
+    directory = os.path.dirname(rendered_path)
+    original_stem = match.group(1)
+    candidate = os.path.join(directory, f"{original_stem}.360")
+    if os.path.exists(candidate):
+        return candidate
+
+    # Case-sensitive filesystems need a small directory lookup for uppercase
+    # or lowercase filename variants.  This is limited to the render's folder.
+    try:
+        expected_name = f"{original_stem}.360".lower()
+        for filename in os.listdir(directory):
+            if filename.lower() == expected_name:
+                candidate = os.path.join(directory, filename)
+                if os.path.isfile(candidate):
+                    return candidate
+    except OSError:
+        pass
+    return None
+
+
+def parse_camera_offsets(text):
+    """Parse one ``path fragment = +/-HH:MM`` rule per line."""
+    offsets = {}
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ValueError(f"Zeile {line_number}: Erwartet wird 'Pfadteil = +HH:MM'.")
+
+        path_fragment, raw_offset = (part.strip() for part in line.split("=", 1))
+        match = re.fullmatch(r"([+-])(\d{1,2}):(\d{2})", raw_offset)
+        if not path_fragment or not match:
+            raise ValueError(f"Zeile {line_number}: Ungültige Zeitkorrektur '{line}'.")
+
+        hours, minutes = int(match.group(2)), int(match.group(3))
+        if minutes >= 60 or hours > 23:
+            raise ValueError(f"Zeile {line_number}: Ungültige Zeitkorrektur '{raw_offset}'.")
+        seconds = hours * 3600 + minutes * 60
+        offsets[path_fragment] = seconds if match.group(1) == "+" else -seconds
+    return offsets
+
+
+def format_camera_offsets(offsets):
+    lines = []
+    for path_fragment, seconds in sorted(offsets.items(), key=lambda item: item[0].lower()):
+        sign = "+" if seconds >= 0 else "-"
+        minutes = abs(seconds) // 60
+        lines.append(f"{path_fragment} = {sign}{minutes // 60:02d}:{minutes % 60:02d}")
+    return "\n".join(lines)
+
+
+def get_camera_offset(filepath, camera_offsets):
+    if not filepath or not camera_offsets:
+        return 0, None
+
+    normalized_path = os.path.normcase(os.path.normpath(filepath)).replace("\\", "/")
+    matches = [
+        (len(fragment), fragment, seconds)
+        for fragment, seconds in camera_offsets.items()
+        if fragment and fragment.replace("\\", "/").lower() in normalized_path.lower()
+    ]
+    if not matches:
+        return 0, None
+
+    _, fragment, seconds = max(matches, key=lambda item: item[0])
+    return seconds, fragment
+
+
+def get_sort_date(filepath, camera_offsets=None):
+    """Return a sortable date plus its source and matching offset rule."""
+    original_360 = find_gopro_original_360(filepath)
+    original_360_date = get_embedded_creation_date(original_360) if original_360 else None
+    embedded = get_embedded_creation_date(filepath)
+
+    if original_360_date is not None:
+        date = original_360_date
+        source = "gopro_original_360"
+    elif embedded is not None:
+        date = embedded
+        source = "embedded"
+    else:
+        date = get_file_creation_date(filepath)
+        source = "filesystem" if date else None
+
+    offset, offset_rule = get_camera_offset(filepath, camera_offsets)
+    if date is not None and offset:
+        date += timedelta(seconds=offset)
+    return date, source, offset_rule
+
+
+def get_best_creation_date(filepath, camera_offsets=None):
+    """Prefer embedded recording metadata; fall back only to this file's date."""
+    return get_sort_date(filepath, camera_offsets)[0]
+
 
 
 def get_file_creation_date(filepath):
@@ -152,7 +385,17 @@ def build_file_registry(root, base_dir, mapping=None):
     return file_id_to_path
 
 
-def build_clip_data(clip, track, track_type, track_index, clip_index, base_dir, mapping, file_id_to_path):
+def build_clip_data(
+    clip,
+    track,
+    track_type,
+    track_index,
+    clip_index,
+    base_dir,
+    mapping,
+    file_id_to_path,
+    camera_offsets=None,
+):
     paths = find_all_file_paths(clip, base_dir, mapping)
     existing = next((path for path, _ in paths if os.path.exists(path)), None)
 
@@ -170,6 +413,9 @@ def build_clip_data(clip, track, track_type, track_index, clip_index, base_dir, 
         if path and (path.startswith("/Volumes/") or path.startswith("/Users/"))
     }
 
+    date, date_source, offset_rule = get_sort_date(existing, camera_offsets) \
+        if existing and track_type == "video" else (None, None, None)
+
     return {
         "element": clip,
         "track": track,
@@ -179,7 +425,9 @@ def build_clip_data(clip, track, track_type, track_index, clip_index, base_dir, 
         "orig_clip_index": clip_index,
         "id": clip.get("id", "?"),
         "path": existing,
-        "date": get_file_creation_date(existing) if existing and track_type == "video" else None,
+        "date": date,
+        "date_source": date_source,
+        "camera_offset_rule": offset_rule,
         "orig_start": get_int_child(clip, "start"),
         "orig_end": get_int_child(clip, "end"),
         "new_start": get_int_child(clip, "start"),
@@ -230,7 +478,7 @@ def parse_links(clip):
     return links
 
 
-def analyze_xml(root, base_dir, mapping=None):
+def analyze_xml(root, base_dir, mapping=None, camera_offsets=None):
     file_id_to_path = build_file_registry(root, base_dir, mapping)
     sequences = [elem for elem in root.iter() if local_name(elem.tag) == "sequence"]
     contexts = []
@@ -241,6 +489,10 @@ def analyze_xml(root, base_dir, mapping=None):
     total_missing = 0
     video_clip_count = 0
     audio_clip_count = 0
+    embedded_date_count = 0
+    filesystem_date_count = 0
+    gopro_original_360_date_count = 0
+    offset_clip_count = 0
 
     for sequence in sequences:
         media = find_child(sequence, "media")
@@ -266,11 +518,27 @@ def analyze_xml(root, base_dir, mapping=None):
             track_clips = []
             for clip_index, clip in enumerate(find_children(track, "clipitem"), start=1):
                 clip_data = build_clip_data(
-                    clip, track, "video", track_index, clip_index, base_dir, mapping, file_id_to_path
+                    clip,
+                    track,
+                    "video",
+                    track_index,
+                    clip_index,
+                    base_dir,
+                    mapping,
+                    file_id_to_path,
+                    camera_offsets,
                 )
                 if clip_data["date"]:
                     sequence_found += 1
                     sequence_dates.append(clip_data["date"])
+                    if clip_data["date_source"] == "gopro_original_360":
+                        gopro_original_360_date_count += 1
+                    elif clip_data["date_source"] == "embedded":
+                        embedded_date_count += 1
+                    elif clip_data["date_source"] == "filesystem":
+                        filesystem_date_count += 1
+                    if clip_data["camera_offset_rule"]:
+                        offset_clip_count += 1
                 else:
                     sequence_missing += 1
                 sequence_macos_paths.update(clip_data["macos_paths"])
@@ -283,7 +551,15 @@ def analyze_xml(root, base_dir, mapping=None):
             track_clips = []
             for clip_index, clip in enumerate(find_children(track, "clipitem"), start=1):
                 clip_data = build_clip_data(
-                    clip, track, "audio", track_index, clip_index, base_dir, mapping, file_id_to_path
+                    clip,
+                    track,
+                    "audio",
+                    track_index,
+                    clip_index,
+                    base_dir,
+                    mapping,
+                    file_id_to_path,
+                    camera_offsets,
                 )
                 sequence_macos_paths.update(clip_data["macos_paths"])
                 track_clips.append(clip_data)
@@ -325,6 +601,10 @@ def analyze_xml(root, base_dir, mapping=None):
         "total_missing": total_missing,
         "video_clip_count": video_clip_count,
         "audio_clip_count": audio_clip_count,
+        "embedded_date_count": embedded_date_count,
+        "filesystem_date_count": filesystem_date_count,
+        "gopro_original_360_date_count": gopro_original_360_date_count,
+        "offset_clip_count": offset_clip_count,
     }
 
 

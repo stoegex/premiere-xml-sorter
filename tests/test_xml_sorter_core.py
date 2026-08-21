@@ -1,10 +1,20 @@
 import os
+import struct
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
-from xml_sorter_core import analyze_xml, find_child, find_children, sort_sequences
+from xml_sorter_core import (
+    QUICKTIME_EPOCH,
+    analyze_xml,
+    find_child,
+    find_children,
+    format_camera_offsets,
+    get_best_creation_date,
+    parse_camera_offsets,
+    sort_sequences,
+)
 
 
 def write_media_file(directory, name, stamp):
@@ -16,11 +26,101 @@ def write_media_file(directory, name, stamp):
     return path
 
 
+def write_quicktime_media_file(directory, name, recording_time, file_stamp):
+    """Create a minimal MOV/MP4 file with a valid QuickTime ``mvhd`` atom."""
+    path = os.path.join(directory, name)
+    seconds = int((recording_time - QUICKTIME_EPOCH).total_seconds())
+    mvhd_payload = b"\x00\x00\x00\x00" + struct.pack(">I", seconds) + b"\x00" * 12
+    mvhd = struct.pack(">I4s", len(mvhd_payload) + 8, b"mvhd") + mvhd_payload
+    moov = struct.pack(">I4s", len(mvhd) + 8, b"moov") + mvhd
+    with open(path, "wb") as handle:
+        handle.write(moov)
+    timestamp = file_stamp.timestamp()
+    os.utime(path, (timestamp, timestamp))
+    return path
+
+
 def file_url(path):
     return "file://" + path
 
 
 class XMLSorterCoreTests(unittest.TestCase):
+    def test_embedded_mov_mp4_dates_override_filesystem_dates_and_apply_camera_offset(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            s1_dir = os.path.join(tempdir, "00_S1II")
+            iphone_dir = os.path.join(tempdir, "01_IPHONE")
+            gopro_dir = os.path.join(tempdir, "04_GOPRO")
+            for directory in (s1_dir, iphone_dir, gopro_dir):
+                os.mkdir(directory)
+
+            base = datetime(2024, 8, 1, 10, 0, tzinfo=timezone.utc)
+            far_future = datetime(2030, 1, 1, 12, 0, 0)
+            s1_path = write_quicktime_media_file(s1_dir, "P1000001.MOV", base, far_future)
+            iphone_path = write_quicktime_media_file(
+                iphone_dir, "IMG_0001.mov", base + timedelta(minutes=10), far_future
+            )
+            gopro_path = write_quicktime_media_file(
+                gopro_dir, "GS010001.mp4", base + timedelta(minutes=20), far_future
+            )
+
+            xml_text = f"""<xmeml><sequence><media><video><track>
+              <clipitem id="gopro"><start>0</start><end>10</end><file><pathurl>{file_url(gopro_path)}</pathurl></file></clipitem>
+              <clipitem id="iphone"><start>10</start><end>20</end><file><pathurl>{file_url(iphone_path)}</pathurl></file></clipitem>
+              <clipitem id="s1"><start>20</start><end>30</end><file><pathurl>{file_url(s1_path)}</pathurl></file></clipitem>
+            </track></video></media></sequence></xmeml>"""
+
+            root = ET.fromstring(xml_text)
+            analysis = analyze_xml(root, tempdir, camera_offsets={"00_S1II": 3600})
+            clips = analysis["sequences"][0]["video_tracks_data"]
+            clips = [clip for track_clips in clips.values() for clip in track_clips]
+            by_id = {clip["id"]: clip for clip in clips}
+
+            expected_s1 = base.astimezone().replace(tzinfo=None) + timedelta(hours=1)
+            self.assertEqual(by_id["s1"]["date"], expected_s1)
+            self.assertEqual(by_id["s1"]["date_source"], "embedded")
+            self.assertEqual(by_id["s1"]["camera_offset_rule"], "00_S1II")
+            self.assertEqual(analysis["embedded_date_count"], 3)
+            self.assertEqual(analysis["filesystem_date_count"], 0)
+            self.assertEqual(analysis["offset_clip_count"], 1)
+
+            sort_sequences(analysis["sequences"])
+            track = analysis["sequences"][0]["sequence"].find("./media/video/track")
+            self.assertEqual([clip.get("id") for clip in find_children(track, "clipitem")], ["iphone", "gopro", "s1"])
+
+    def test_filesystem_date_is_used_when_embedded_date_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            expected = datetime(2024, 3, 2, 9, 30, 0)
+            path = write_media_file(tempdir, "transcoded.mov", expected)
+            self.assertEqual(get_best_creation_date(path), expected)
+
+    def test_gopro_render_uses_matching_original_360_recording_time(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            original_time = datetime(2024, 8, 16, 4, 14, 36, tzinfo=timezone.utc)
+            render_time = datetime(2024, 8, 16, 17, 53, 23, tzinfo=timezone.utc)
+            far_future = datetime(2030, 1, 1, 12, 0, 0)
+            write_quicktime_media_file(tempdir, "GS010592.360", original_time, far_future)
+            rendered_path = write_quicktime_media_file(
+                tempdir, "GS010592_2024-08-16_19-51-36-975.mp4", render_time, far_future
+            )
+            xml_text = f"""<xmeml><sequence><media><video><track>
+              <clipitem id="render"><start>0</start><end>10</end><file><pathurl>{file_url(rendered_path)}</pathurl></file></clipitem>
+            </track></video></media></sequence></xmeml>"""
+
+            analysis = analyze_xml(ET.fromstring(xml_text), tempdir)
+            clip = next(iter(analysis["sequences"][0]["video_tracks_data"].values()))[0]
+
+            self.assertEqual(clip["date"], original_time.astimezone().replace(tzinfo=None))
+            self.assertEqual(clip["date_source"], "gopro_original_360")
+            self.assertEqual(analysis["gopro_original_360_date_count"], 1)
+            self.assertEqual(analysis["embedded_date_count"], 0)
+
+    def test_camera_offset_rules_are_validated_and_formatted(self):
+        offsets = parse_camera_offsets("00_S1II = +01:00\n# comment\nGoPro = -00:30")
+        self.assertEqual(offsets, {"00_S1II": 3600, "GoPro": -1800})
+        self.assertEqual(format_camera_offsets(offsets), "00_S1II = +01:00\nGoPro = -00:30")
+        with self.assertRaises(ValueError):
+            parse_camera_offsets("S1II = 1 hour")
+
     def test_linked_audio_moves_with_linked_video_group(self):
         with tempfile.TemporaryDirectory() as tempdir:
             a_path = write_media_file(tempdir, "a.mov", datetime(2024, 1, 1, 10, 0, 0))

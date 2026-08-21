@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-FCP XML Sorter v3.2 – Sortiert Premiere/FCP XML Timelines nach Erstellungsdatum.
+FCP XML Sorter v3.3 – Sortiert Premiere/FCP XML Timelines nach Aufnahmezeit.
 """
 import xml.etree.ElementTree as ET
 import customtkinter as ctk
 from tkinter import filedialog
 import os
 from datetime import datetime
-from xml_sorter_core import analyze_xml, find_child, indent, sort_sequences
+from xml_sorter_core import (
+    analyze_xml,
+    find_child,
+    format_camera_offsets,
+    indent,
+    parse_camera_offsets,
+    parse_with_repair,
+    sort_sequences,
+)
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -50,15 +58,15 @@ class FCPXMLSorter:
         ctk.set_default_color_theme("dark-blue")
         self.window = TkinterDnD_CTk()
         self.window.title("FCP XML Sorter")
-        self.window.geometry("800x620")
-        self.window.minsize(680, 520)
+        self.window.geometry("800x670")
+        self.window.minsize(680, 560)
         self.window.configure(fg_color=C_BG)
 
         # Fenster zentrieren
         self.window.update_idletasks()
         sw = self.window.winfo_screenwidth()
         sh = self.window.winfo_screenheight()
-        self.window.geometry(f"800x620+{(sw - 800)//2}+{(sh - 620)//2}")
+        self.window.geometry(f"800x670+{(sw - 800)//2}+{(sh - 670)//2}")
 
         self.filepath = None
         self.tree = None
@@ -67,6 +75,7 @@ class FCPXMLSorter:
         self.files_found = 0
         self.files_missing = 0
         self.mapping = {}
+        self.camera_offsets = {}
 
         self._build_ui()
 
@@ -89,7 +98,7 @@ class FCPXMLSorter:
             text_color=C_ACCENT,
         ).grid(row=0, column=0)
         ctk.CTkLabel(
-            hdr, text="Sortiert Clips nach Erstellungsdatum der Quelldatei  ·  aufsteigend",
+            hdr, text="Sortiert Clips nach Aufnahmezeit der Videoquelle  ·  aufsteigend",
             font=ctk.CTkFont(family="Arial", size=12),
             text_color=C_MUTED,
         ).grid(row=1, column=0, pady=(3, 0))
@@ -195,12 +204,21 @@ class FCPXMLSorter:
         )
         self.mapping_label.grid(row=2, column=0, sticky="w", pady=(0, 4))
 
+        self.camera_offset_btn = ctk.CTkButton(
+            btm, text="⏱  Kamera-Uhr korrigieren",
+            font=ctk.CTkFont(family="Arial", size=11),
+            fg_color=C_SURFACE, hover_color=C_CARD, text_color=C_TEXT2,
+            corner_radius=8, height=28, width=190,
+            command=self._edit_camera_offsets,
+        )
+        self.camera_offset_btn.grid(row=3, column=0, sticky="w", pady=(0, 6))
+
         # Fortschrittsbalken (schlank, immer sichtbar)
         self.progress = ctk.CTkProgressBar(
             btm, progress_color=C_ACCENT, fg_color=C_SURFACE,
             height=5, corner_radius=3, mode="indeterminate",
         )
-        self.progress.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        self.progress.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         self.progress.set(0)
 
         # Sortier-Button
@@ -211,7 +229,7 @@ class FCPXMLSorter:
             corner_radius=12, height=44, state="disabled",
             command=self._sort_and_save,
         )
-        self.sort_btn.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        self.sort_btn.grid(row=5, column=0, sticky="ew", pady=(0, 8))
 
         # Ergebnis-Label
         self.stats_label = ctk.CTkLabel(
@@ -219,21 +237,21 @@ class FCPXMLSorter:
             font=ctk.CTkFont(family="Arial", size=12),
             text_color=C_SUCCESS, wraplength=700, justify="left", anchor="w",
         )
-        self.stats_label.grid(row=5, column=0, sticky="ew", pady=(0, 2))
+        self.stats_label.grid(row=6, column=0, sticky="ew", pady=(0, 2))
 
         self.error_label = ctk.CTkLabel(
             btm, text="",
             font=ctk.CTkFont(family="Arial", size=12),
             text_color=C_ERROR, wraplength=700, justify="left", anchor="w",
         )
-        self.error_label.grid(row=6, column=0, sticky="ew", pady=(0, 4))
+        self.error_label.grid(row=7, column=0, sticky="ew", pady=(0, 4))
 
         # Log-Bereich
         ctk.CTkLabel(
             btm, text="LOG",
             font=ctk.CTkFont(family="Courier New", size=9, weight="bold"),
             text_color=C_MUTED, anchor="w",
-        ).grid(row=7, column=0, sticky="w", pady=(0, 2))
+        ).grid(row=8, column=0, sticky="w", pady=(0, 2))
 
         self.log_text = ctk.CTkTextbox(
             btm,
@@ -241,7 +259,7 @@ class FCPXMLSorter:
             fg_color=C_LOG_BG, text_color=C_LOG_TEXT,
             corner_radius=8, height=80, activate_scrollbars=True,
         )
-        self.log_text.grid(row=8, column=0, sticky="ew")
+        self.log_text.grid(row=9, column=0, sticky="ew")
         self.log_text.configure(state="disabled")
 
     def _hover(self, entering: bool) -> None:
@@ -252,6 +270,61 @@ class FCPXMLSorter:
             bc = C_ACCENT_H if self.filepath else C_ACCENT
             self.drop_frame.configure(border_color=bc)
             self.dz_main.configure(text_color=C_TEXT2)
+
+    def _edit_camera_offsets(self):
+        dialog = ctk.CTkToplevel(self.window)
+        dialog.title("Kamera-Uhr korrigieren")
+        dialog.geometry("540x360")
+        dialog.resizable(False, False)
+        dialog.transient(self.window)
+        dialog.grab_set()
+        dialog.configure(fg_color=C_BG)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                "Zeitkorrekturen je Kamera/Ordner. Eine Regel pro Zeile:\n"
+                "Pfadteil = +/-HH:MM     Beispiel: 00_S1II = +01:00"
+            ),
+            font=ctk.CTkFont(family="Arial", size=12),
+            text_color=C_TEXT2, justify="left", anchor="w",
+        ).grid(row=0, column=0, padx=22, pady=(22, 10), sticky="ew")
+
+        editor = ctk.CTkTextbox(
+            dialog, font=ctk.CTkFont(family="Consolas", size=12),
+            fg_color=C_LOG_BG, text_color=C_TEXT1, corner_radius=8,
+        )
+        editor.grid(row=1, column=0, padx=22, pady=(0, 8), sticky="nsew")
+        editor.insert("1.0", format_camera_offsets(self.camera_offsets))
+
+        feedback = ctk.CTkLabel(
+            dialog, text="", font=ctk.CTkFont(size=11), text_color=C_ERROR, anchor="w",
+        )
+        feedback.grid(row=2, column=0, padx=22, pady=(0, 6), sticky="ew")
+
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.grid(row=3, column=0, padx=22, pady=(0, 20), sticky="e")
+
+        def save_offsets():
+            try:
+                self.camera_offsets = parse_camera_offsets(editor.get("1.0", "end-1c"))
+            except ValueError as error:
+                feedback.configure(text=str(error))
+                return
+            dialog.destroy()
+            if self.filepath:
+                self._load_xml()
+
+        ctk.CTkButton(
+            buttons, text="Abbrechen", width=100, fg_color=C_SURFACE,
+            hover_color=C_CARD, command=dialog.destroy,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            buttons, text="Übernehmen", width=110, fg_color=C_ACCENT,
+            hover_color=C_ACCENT_H, command=save_offsets,
+        ).pack(side="left")
 
     def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -303,14 +376,16 @@ class FCPXMLSorter:
         self.log(f"{os.path.basename(self.filepath)}")
 
         try:
-            self.tree = ET.parse(self.filepath)
+            self.tree, repaired = parse_with_repair(self.filepath, logger=self.log)
             root = self.tree.getroot()
+            if repaired:
+                self.log("[Warnung] XML-Datei wurde repariert, da sie unvollständig war (Clips könnten fehlen).")
         except Exception as e:
             self._show_error(f"{e}")
             return
 
         base_dir = os.path.dirname(os.path.abspath(self.filepath))
-        analysis = analyze_xml(root, base_dir, self.mapping)
+        analysis = analyze_xml(root, base_dir, self.mapping, self.camera_offsets)
         self.sequence_contexts = analysis["sequences"]
         self.total_clips = analysis["video_clip_count"]
         self.files_found = analysis["total_found"]
@@ -321,6 +396,13 @@ class FCPXMLSorter:
         self.log(
             f"Video-Clips: {self.total_clips} ({self.files_found} mit Datum, {self.files_missing} ohne)"
         )
+        self.log(
+            f"Zeitquelle: {analysis['gopro_original_360_date_count']} GoPro-Original-360, "
+            f"{analysis['embedded_date_count']} eingebettete Metadaten, "
+            f"{analysis['filesystem_date_count']} Dateisystem-Fallbacks"
+        )
+        if analysis["offset_clip_count"]:
+            self.log(f"Kamera-Uhrkorrektur auf {analysis['offset_clip_count']} Video-Clips angewendet")
         self.log(
             f"Audio-Clips: {analysis['audio_clip_count']} (werden link-basiert synchron verschoben)"
         )
@@ -364,8 +446,13 @@ class FCPXMLSorter:
             else:
                 self.log("Keine Dateien gefunden. \u00dcberpr\u00fcfe die Pfade in der XML.")
 
+        notices = []
+        if self.camera_offsets:
+            notices.append(f"Kamera-Uhrkorrektur aktiv: {format_camera_offsets(self.camera_offsets).replace(chr(10), '  ·  ')}")
         if self.mapping:
-            self.mapping_label.configure(text=f"Mapping aktiv: {self.mapping}")
+            notices.append(f"Pfad-Mapping aktiv: {self.mapping}")
+        if notices:
+            self.mapping_label.configure(text="  ·  ".join(notices))
         if self.total_clips > 0:
             self.sort_btn.configure(state="normal")
         else:
